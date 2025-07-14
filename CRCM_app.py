@@ -397,6 +397,7 @@ with st.expander("⚙️ Efficiency Optimizer", expanded=False):
                 lambda mods: extract_tb(mods, BLOCK_UNIT_LIMITS.keys())
             )
             df = pd.concat([df, filler_df], ignore_index=True)
+            df['Time Block'] = df['Modifiers Applied'].apply(lambda mods: extract_tb(mods, BLOCK_UNIT_LIMITS.keys()))
         st.success("✅ Optimization complete!")
 
         # 8. Summarize in chronological block order for display

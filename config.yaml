@@ -1,0 +1,11 @@
+credentials:
+  usernames:
+    moe:
+      name: Dr. Almikhlafi
+      password: '$2b$12$vqgoXJZqWlAHvuMR5a2P0uchYtDEMH4Ev9YohnV0JViX2NisU.mWq'
+cookie:
+  name: ccm_billing_app
+  key: 'your_secret_key'
+  expiry_days: 7
+preauthorized:
+  emails: []

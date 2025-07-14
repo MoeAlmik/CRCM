@@ -307,10 +307,21 @@ def billing_summary(entries, total_hours, is_weekend):
     return df, unused_units  # <-- ALWAYS returns!
 
 # ---- Main UI logic for Calculate and Optimizer ----
+# We will store the latest DataFrame and unused_units in session state for safe use later
+if 'billing_df' not in st.session_state:
+    st.session_state.billing_df = None
+if 'unused_units' not in st.session_state:
+    st.session_state.unused_units = 0
+if 'block_unit_limits' not in st.session_state:
+    st.session_state.block_unit_limits = None
+
 with st.expander("🧮 Calculate (No Optimization)", expanded=False):
     if st.button("Calculate Billing"):
         total_hours = st.number_input("Total hours worked (for summary only, not optimization):", min_value=0.0, value=0.0, step=0.25, key="noopt_hours")
-        df, _ = billing_summary(st.session_state.entries, total_hours, is_weekend)
+        df, unused_units = billing_summary(st.session_state.entries, total_hours, is_weekend)
+        st.session_state.billing_df = df
+        st.session_state.unused_units = unused_units
+        st.session_state.block_unit_limits, _ = get_block_limits_and_order(is_weekend)
         summary_df = df.groupby(['HSC Code', 'Description', 'Time Block']).agg(
             Calls=('Calls', 'sum'),
             Units=('Units', 'sum'),
@@ -328,174 +339,117 @@ with st.expander("⚙️ Efficiency Optimizer", expanded=False):
 
     if run_opt:
         BLOCK_UNIT_LIMITS, _ = get_block_limits_and_order(is_weekend)
-
         # 1. Get a fresh copy of user-entered events
         df, unused_units = billing_summary(st.session_state.entries, total_hours, is_weekend)
+        st.session_state.billing_df = df
+        st.session_state.unused_units = unused_units
+        st.session_state.block_unit_limits = BLOCK_UNIT_LIMITS
+
         units_allowed = int(total_hours * 4)
         units_used_total = int(df['Units'].sum())
         units_to_allocate = max(units_allowed - units_used_total, 0)
 
-        # 2. Chronological order for display
+        # ... [rest of your optimizer code here, unchanged] ...
+
+        # --- [at the end, after st.metric("Block Utilization Efficiency", ...): ] ---
+
+# ---- Visual Summary Section: Safe Use of df ----
+with st.expander("📈 Visual Summary: Billing by Time Block (Before & After Optimization)", expanded=True):
+    # Only show visualizations if billing_df is available
+    if st.session_state.get('billing_df') is not None:
+        df = st.session_state.billing_df
+        unused_units = st.session_state.get('unused_units', 0)
+        BLOCK_UNIT_LIMITS = st.session_state.get('block_unit_limits', {})
+
+        # Define block order for categorical display
         CHRONOLOGICAL_BLOCK_ORDER = ["03.05N", "03.05P", "03.05QA", "03.05QB"]
 
-
-        # 3. Filler allocation order (skip 03.05QB for optimizer)
-        FILLER_BLOCK_ORDER = ["03.05N", "03.05P", "03.05QA"]  # A (day), B (eve), C (late eve)
-
-
-
-        # 4. Only fill time blocks where a patient was seen
-        ACTIVE_HSC_FOR_FILLER = ["03.08A", "03.07B", "03.05A"]
-        active_blocks = set(
-            df[df['HSC Code'].isin(ACTIVE_HSC_FOR_FILLER)]['Time Block'].dropna().unique()
-        )
-
-        # 5. Current units used per block
-        units_used_by_block = df.groupby('Time Block')['Units'].sum().to_dict()
-
-        # 6. Filler logic
-        fillers = []
-        for code in FILLER_BLOCK_ORDER:
-            block_cap = BLOCK_UNIT_LIMITS[code]
-            already_used = int(units_used_by_block.get(code, 0))
-            block_remaining = max(block_cap - already_used, 0)
-            to_add = min(units_to_allocate, block_remaining)
-            for _ in range(to_add):
-                fillers.append(sanitize_entry(icu_visit_03_05A(1, [code]), "Optimizer"))
-            units_to_allocate -= to_add
-            units_used_by_block[code] = already_used + to_add
-            if units_to_allocate <= 0:
-                break
-
-        # 7. Append filler visits to the DataFrame
-        if fillers:
-            filler_df = pd.DataFrame(fillers)
-            for col in filler_df.columns:
-                filler_df[col] = filler_df[col].astype(str)
-            filler_df['Units'] = pd.to_numeric(filler_df.get("Units", 1), errors="coerce").fillna(1.0)
-            filler_df['Calls'] = pd.to_numeric(filler_df.get("Calls", 1), errors="coerce").fillna(1.0)
-            filler_df['Total Fee'] = pd.to_numeric(filler_df.get("Total Fee", 0), errors="coerce").fillna(0.0)
-            filler_df['Time Block'] = filler_df['Modifiers Applied'].apply(
-                lambda mods: extract_tb(mods, BLOCK_UNIT_LIMITS.keys())
-            )
-            df = pd.concat([df, filler_df], ignore_index=True)
-        st.success("✅ Optimization complete!")
-
-        # 8. Summarize in chronological block order for display
-        summary_df = df.groupby(['HSC Code', 'Description', 'Time Block', 'Source']).agg(
-            Calls=('Calls', 'sum'),
+        # DataFrame 'df' must include all entries with a "Source" column ("Original" or "Optimizer")
+        timeline = df.groupby(["Time Block", "Source"]).agg(
             Units=('Units', 'sum'),
-            Total_Fee=('Total Fee', 'sum')
+            Total_Fee=('Total Fee', 'sum'),
+            Calls=('Calls', 'sum')
         ).reset_index()
 
-        # Force categorical display for correct order
-        summary_df['Time Block'] = pd.Categorical(
-            summary_df['Time Block'], categories=CHRONOLOGICAL_BLOCK_ORDER, ordered=True
+        # Set categorical order for time blocks
+        timeline['Time Block'] = pd.Categorical(
+            timeline['Time Block'], categories=CHRONOLOGICAL_BLOCK_ORDER, ordered=True
         )
-        summary_df = summary_df.sort_values("Time Block")
+        timeline = timeline.sort_values("Time Block")
 
-        st.write(df[['HSC Code', 'Description', 'Units', 'Calls', 'Modifiers Applied', 'Time Block']])
-        st.dataframe(summary_df)
-        st.metric("Total Calls", int(summary_df['Calls'].sum()))
-        st.metric("Total Units (15-min blocks)", int(summary_df['Units'].sum()))
-        st.metric("Total Billing Amount", f"${summary_df['Total_Fee'].sum():,.2f}")
+        # Define custom colors: highlight Optimizer in gold/orange
+        custom_colors = {
+            "Original": "#4E79A7",    # blue
+            "Optimizer": "#FFC300",   # bright gold/yellow
+        }
 
-        # Export option
-        csv = summary_df.to_csv(index=False).encode('utf-8')
-        st.download_button("⬇️ Download Results as CSV", data=csv, file_name="ccm_billing_summary.csv")
+        # Units bar: emphasize Optimizer
+        fig_units = px.bar(
+            timeline, x="Time Block", y="Units", color="Source",
+            color_discrete_map=custom_colors,
+            title="Units Billed per Time Block: Original vs. Optimized (Bright Highlight = Optimizer)",
+            labels={"Units": "Units (15-min blocks)", "Source": "Entry Type"},
+            text_auto=True,
+            barmode="stack",
+            hover_data=["Calls"]
+        )
+        fig_units.update_layout(legend=dict(orientation="h", y=-0.2))
 
+        # Add fee annotation for each block (top of stack)
+        fee_per_block = timeline.groupby("Time Block")["Total_Fee"].sum().reset_index()
+        for i, row in fee_per_block.iterrows():
+            fig_units.add_annotation(
+                x=row["Time Block"],
+                y=timeline[timeline["Time Block"] == row["Time Block"]]["Units"].sum(),
+                text=f"${row['Total_Fee']:.0f}",
+                showarrow=False,
+                yshift=14,
+                font=dict(size=13, color="black")
+            )
+
+        st.plotly_chart(fig_units, use_container_width=True)
+
+        # Revenue bar: same structure, but y=Total_Fee
+        fig_fees = px.bar(
+            timeline, x="Time Block", y="Total_Fee", color="Source",
+            color_discrete_map=custom_colors,
+            title="Revenue per Time Block: Original vs. Optimized (Bright Highlight = Optimizer)",
+            labels={"Total_Fee": "Fee ($)", "Source": "Entry Type"},
+            text_auto=".2s",
+            barmode="stack"
+        )
+        fig_fees.update_layout(legend=dict(orientation="h", y=-0.2))
+
+        st.plotly_chart(fig_fees, use_container_width=True)
+
+        # Show summary table per block (totals)
+        block_summary = df.groupby("Time Block").agg(
+            Units=('Units', 'sum'),
+            Calls=('Calls', 'sum'),
+            Total_Fee=('Total Fee', 'sum')
+        ).reset_index()
+        block_summary["Max Units"] = block_summary["Time Block"].map(BLOCK_UNIT_LIMITS)
+        block_summary["Percent Used"] = (
+            100 * block_summary["Units"] / block_summary["Max Units"]
+        ).round(1).astype(str) + "%"
+
+        st.markdown("#### ⏳ Block Summary Table")
+        st.dataframe(block_summary, hide_index=True)
+
+        # Key metrics
+        st.markdown("### 💰 Billing Metrics")
+        st.metric("Total Units", int(df["Units"].sum()))
+        st.metric("Total Fee", f"${df['Total Fee'].sum():,.2f}")
         total_units_possible = sum(BLOCK_UNIT_LIMITS.values())
-        actual_units_used = int(df['Units'].sum())
+        actual_units_used = int(df["Units"].sum())
         efficiency_pct = 100.0 * actual_units_used / total_units_possible if total_units_possible else 0
         st.metric("Block Utilization Efficiency", f"{efficiency_pct:.1f}%")
+        if unused_units > 0:
+            st.warning(f"⚠️ You have {unused_units} 15-min blocks of time not billable due to max units per block.")
 
-        # --- Visuals ---
-with st.expander("📈 Visual Summary: Billing by Time Block (Before & After Optimization)", expanded=True):
-    # DataFrame 'df' must include all entries with a "Source" column ("Original" or "Optimizer")
-    # Group by block + source for stacked bar
-    timeline = df.groupby(["Time Block", "Source"]).agg(
-        Units=('Units', 'sum'),
-        Total_Fee=('Total Fee', 'sum'),
-        Calls=('Calls', 'sum')
-    ).reset_index()
-
-    # Set categorical order for time blocks
-    timeline['Time Block'] = pd.Categorical(
-        timeline['Time Block'], categories=CHRONOLOGICAL_BLOCK_ORDER, ordered=True
-    )
-    timeline = timeline.sort_values("Time Block")
-
-    # Define custom colors: highlight Optimizer in gold/orange
-    custom_colors = {
-        "Original": "#4E79A7",    # blue
-        "Optimizer": "#FFC300",   # bright gold/yellow
-    }
-
-    # Units bar: emphasize Optimizer
-    fig_units = px.bar(
-        timeline, x="Time Block", y="Units", color="Source",
-        color_discrete_map=custom_colors,
-        title="Units Billed per Time Block: Original vs. Optimized (Bright Highlight = Optimizer)",
-        labels={"Units": "Units (15-min blocks)", "Source": "Entry Type"},
-        text_auto=True,
-        barmode="stack",
-        hover_data=["Calls"]
-    )
-    fig_units.update_layout(legend=dict(orientation="h", y=-0.2))
-
-    # Add fee annotation for each block (top of stack)
-    fee_per_block = timeline.groupby("Time Block")["Total_Fee"].sum().reset_index()
-    for i, row in fee_per_block.iterrows():
-        fig_units.add_annotation(
-            x=row["Time Block"],
-            y=timeline[timeline["Time Block"] == row["Time Block"]]["Units"].sum(),
-            text=f"${row['Total_Fee']:.0f}",
-            showarrow=False,
-            yshift=14,
-            font=dict(size=13, color="black")
+        st.caption(
+            "The bright bars show the revenue and unit gain from optimization/filler logic. "
+            "Compare how many more units and dollars are captured per block!"
         )
-
-    st.plotly_chart(fig_units, use_container_width=True)
-
-    # Revenue bar: same structure, but y=Total_Fee
-    fig_fees = px.bar(
-        timeline, x="Time Block", y="Total_Fee", color="Source",
-        color_discrete_map=custom_colors,
-        title="Revenue per Time Block: Original vs. Optimized (Bright Highlight = Optimizer)",
-        labels={"Total_Fee": "Fee ($)", "Source": "Entry Type"},
-        text_auto=".2s",
-        barmode="stack"
-    )
-    fig_fees.update_layout(legend=dict(orientation="h", y=-0.2))
-
-    st.plotly_chart(fig_fees, use_container_width=True)
-
-    # Show summary table per block (totals)
-    block_summary = df.groupby("Time Block").agg(
-        Units=('Units', 'sum'),
-        Calls=('Calls', 'sum'),
-        Total_Fee=('Total Fee', 'sum')
-    ).reset_index()
-    block_summary["Max Units"] = block_summary["Time Block"].map(BLOCK_UNIT_LIMITS)
-    block_summary["Percent Used"] = (
-        100 * block_summary["Units"] / block_summary["Max Units"]
-    ).round(1).astype(str) + "%"
-
-    st.markdown("#### ⏳ Block Summary Table")
-    st.dataframe(block_summary, hide_index=True)
-
-    # Key metrics
-    st.markdown("### 💰 Billing Metrics")
-    st.metric("Total Units", int(df["Units"].sum()))
-    st.metric("Total Fee", f"${df['Total Fee'].sum():,.2f}")
-    total_units_possible = sum(BLOCK_UNIT_LIMITS.values())
-    actual_units_used = int(df["Units"].sum())
-    efficiency_pct = 100.0 * actual_units_used / total_units_possible if total_units_possible else 0
-    st.metric("Block Utilization Efficiency", f"{efficiency_pct:.1f}%")
-    if unused_units > 0:
-        st.warning(f"⚠️ You have {unused_units} 15-min blocks of time not billable due to max units per block.")
-
-    st.caption(
-        "The bright bars show the revenue and unit gain from optimization/filler logic. "
-        "Compare how many more units and dollars are captured per block!"
-    )
+    else:
+        st.info("To see visual summaries, please run either the Calculate Billing or the Optimizer above.")
